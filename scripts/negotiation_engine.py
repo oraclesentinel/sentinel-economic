@@ -152,6 +152,32 @@ class NegotiationEngine:
         
         return round(unit_price * quantity, 4)
     
+
+    def _get_service_settings(self, service_id: str) -> dict:
+        """Get service negotiation settings from database"""
+        conn = self._get_db()
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT min_acceptable_ratio, min_price, max_price, negotiation_mode
+            FROM services WHERE id = ?
+        """, (service_id,))
+        row = cursor.fetchone()
+        conn.close()
+        
+        if row:
+            return {
+                'min_acceptable_ratio': row['min_acceptable_ratio'] or 0.6,
+                'min_price': row['min_price'] or 0.001,
+                'max_price': row['max_price'] or 1.0,
+                'negotiation_mode': row['negotiation_mode'] or 'auto'
+            }
+        # Default settings
+        return {
+            'min_acceptable_ratio': 0.6,
+            'min_price': 0.001,
+            'max_price': 1.0,
+            'negotiation_mode': 'auto'
+        }
     def start_negotiation(self, service_id: str, endpoint: str, buyer_id: str,
                           offered_price: float, quantity: int = 1) -> NegotiationResponse:
         """Start a new negotiation"""
@@ -160,8 +186,42 @@ class NegotiationEngine:
         our_price = self._get_our_price(service_id, endpoint, quantity)
         buyer_trust = self._get_buyer_trust(buyer_id)
         
-        # Decision logic
-        min_acceptable = our_price * 0.6  # Floor: 40% below our price
+        # Get service settings from database
+        settings = self._get_service_settings(service_id)
+        
+        # Check if negotiation is disabled
+        if settings['negotiation_mode'] in ['disabled', 'fixed']:
+            now = datetime.now(UTC)
+            expires_at = (now + timedelta(minutes=30)).isoformat()
+            # Save as rejected
+            conn = self._get_db()
+            cursor = conn.cursor()
+            cursor.execute("""
+                INSERT INTO negotiations
+                (id, service_id, endpoint, buyer_id, quantity, initial_offer, current_offer,
+                 our_price, counter_price, status, round_number, final_price, expires_at, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (negotiation_id, service_id, endpoint, buyer_id, quantity, offered_price,
+                  offered_price, our_price, our_price, 'rejected', 1, None,
+                  expires_at, now.isoformat(), now.isoformat()))
+            conn.commit()
+            conn.close()
+            return NegotiationResponse(
+                negotiation_id=negotiation_id,
+                status=NegotiationStatus.REJECTED.value,
+                our_price=our_price,
+                counter_price=our_price,
+                final_price=None,
+                message="Negotiation is disabled for this service. Please pay the listed price.",
+                expires_at=expires_at,
+                round_number=1
+            )
+        
+        # Calculate min_acceptable using service settings
+        # min_acceptable = our_price * min_acceptable_ratio
+        # But also respect absolute min_price from settings
+        min_acceptable_by_ratio = our_price * settings['min_acceptable_ratio']
+        min_acceptable = max(min_acceptable_by_ratio, settings['min_price'])
         
         now = datetime.now(UTC)
         expires_at = (now + timedelta(minutes=30)).isoformat()
