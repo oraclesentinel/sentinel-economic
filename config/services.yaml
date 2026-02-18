@@ -1,0 +1,53 @@
+# Sentinel Economic - Service Registry
+# Semua services yang menggunakan Sentinel Economic
+
+services:
+  oracle_sentinel:
+    name: "Oracle Sentinel Predict"
+    base_url: "https://api.oraclesentinel.xyz"
+    treasury_wallet: "LXzWaDDkSkDQSAvRfArcYwRSq2pjgrVFidGbbnWbiD9"
+    token_gating:
+      enabled: true
+      mint: "HuDBwWRsa4bu8ueaCb7PPgJrqBeZDkcyFqMW5bbXpump"
+      min_balance: 1000
+    endpoints:
+      "/api/v1/signal":
+        price: 0.01
+        description: "Trading signal for a market"
+      "/api/v1/analysis":
+        price: 0.03
+        description: "Full AI analysis"
+      "/api/v1/whale":
+        price: 0.02
+        description: "Whale trade data"
+      "/api/v1/bulk":
+        price: 0.08
+        description: "Bulk signals"
+      "/api/v1/analyze":
+        price: 0.05
+        description: "Custom market analysis"
+
+  sentinel_code:
+    name: "Sentinel Code"
+    base_url: "https://code.oraclesentinel.xyz"
+    treasury_wallet: "LXzWaDDkSkDQSAvRfArcYwRSq2pjgrVFidGbbnWbiD9"
+    token_gating:
+      enabled: true
+      mint: "HuDBwWRsa4bu8ueaCb7PPgJrqBeZDkcyFqMW5bbXpump"
+      min_balance: 1000
+    endpoints:
+      "/api/code/scan":
+        price: 0.01
+        description: "Scan repository for vulnerabilities"
+      "/api/code/report":
+        price: 0.05
+        description: "Full security report"
+
+# Global settings
+global:
+  network: "solana-mainnet"
+  network_string: "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp"
+  facilitator_url: "https://facilitator.payai.network"
+  usdc_mint: "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+  usdc_decimals: 6
+  default_currency: "USDC"

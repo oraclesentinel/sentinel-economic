@@ -1,0 +1,811 @@
+#!/usr/bin/env python3
+"""
+Sentinel Economic — Dashboard API
+Complete API for seller and buyer dashboard
+"""
+
+import os
+import sys
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+import json
+import sqlite3
+import hashlib
+import secrets
+from datetime import datetime, UTC, timedelta
+from functools import wraps
+from flask import Blueprint, jsonify, request, g
+
+DB_PATH = os.path.expanduser("~/sentinel-economic/data/sentinel_economic.db")
+
+dashboard_api = Blueprint('dashboard', __name__, url_prefix='/api/dashboard')
+
+
+def get_db():
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def auth_required(f):
+    """Require authentication via API key or wallet signature"""
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        api_key = request.headers.get('X-API-Key')
+        wallet = request.headers.get('X-Wallet-Address')
+        
+        conn = get_db()
+        cursor = conn.cursor()
+        
+        user = None
+        
+        if api_key:
+            key_hash = hashlib.sha256(api_key.encode()).hexdigest()
+            cursor.execute("""
+                SELECT u.* FROM users u
+                JOIN api_keys ak ON u.id = ak.user_id
+                WHERE ak.key_hash = ? AND ak.status = 'active'
+            """, (key_hash,))
+            user = cursor.fetchone()
+        elif wallet:
+            cursor.execute("SELECT * FROM users WHERE wallet_address = ?", (wallet,))
+            user = cursor.fetchone()
+            
+            if not user:
+                # Auto-create user for new wallet
+                user_id = f"user_{secrets.token_hex(8)}"
+                now = datetime.now(UTC).isoformat()
+                cursor.execute("""
+                    INSERT INTO users (id, wallet_address, created_at, last_active)
+                    VALUES (?, ?, ?, ?)
+                """, (user_id, wallet, now, now))
+                conn.commit()
+                cursor.execute("SELECT * FROM users WHERE id = ?", (user_id,))
+                user = cursor.fetchone()
+        
+        conn.close()
+        
+        if not user:
+            return jsonify({"error": "Authentication required"}), 401
+        
+        g.user = dict(user)
+        return f(*args, **kwargs)
+    
+    return decorated
+
+
+# ═══════════════════════════════════════════════════════════════
+# USER ENDPOINTS
+# ═══════════════════════════════════════════════════════════════
+
+@dashboard_api.route('/user/profile')
+@auth_required
+def get_profile():
+    """Get current user profile"""
+    return jsonify({"user": g.user})
+
+
+@dashboard_api.route('/user/profile', methods=['PUT'])
+@auth_required
+def update_profile():
+    """Update user profile"""
+    data = request.json
+    allowed_fields = ['display_name', 'email', 'bio', 'website', 'twitter', 
+                      'notification_email', 'notification_webhook']
+    
+    updates = {k: v for k, v in data.items() if k in allowed_fields}
+    if not updates:
+        return jsonify({"error": "No valid fields to update"}), 400
+    
+    conn = get_db()
+    cursor = conn.cursor()
+    
+    set_clause = ", ".join([f"{k} = ?" for k in updates.keys()])
+    values = list(updates.values()) + [g.user['id']]
+    
+    cursor.execute(f"UPDATE users SET {set_clause} WHERE id = ?", values)
+    conn.commit()
+    conn.close()
+    
+    return jsonify({"status": "updated", "fields": list(updates.keys())})
+
+
+@dashboard_api.route('/user/api-keys')
+@auth_required
+def list_api_keys():
+    """List user's API keys"""
+    conn = get_db()
+    cursor = conn.cursor()
+    
+    cursor.execute("""
+        SELECT id, name, permissions, last_used, created_at, status
+        FROM api_keys WHERE user_id = ?
+    """, (g.user['id'],))
+    
+    keys = [dict(row) for row in cursor.fetchall()]
+    conn.close()
+    
+    return jsonify({"api_keys": keys})
+
+
+@dashboard_api.route('/user/api-keys', methods=['POST'])
+@auth_required
+def create_api_key():
+    """Create new API key"""
+    data = request.json
+    name = data.get('name', 'Default Key')
+    permissions = data.get('permissions', 'read')
+    
+    # Generate key
+    raw_key = f"se_{secrets.token_hex(24)}"
+    key_hash = hashlib.sha256(raw_key.encode()).hexdigest()
+    
+    conn = get_db()
+    cursor = conn.cursor()
+    
+    cursor.execute("""
+        INSERT INTO api_keys (user_id, key_hash, name, permissions, created_at)
+        VALUES (?, ?, ?, ?, ?)
+    """, (g.user['id'], key_hash, name, permissions, datetime.now(UTC).isoformat()))
+    
+    conn.commit()
+    conn.close()
+    
+    # Return raw key only once
+    return jsonify({
+        "api_key": raw_key,
+        "name": name,
+        "message": "Save this key - it won't be shown again"
+    })
+
+
+@dashboard_api.route('/user/notifications')
+@auth_required
+def get_notifications():
+    """Get user notifications"""
+    conn = get_db()
+    cursor = conn.cursor()
+    
+    cursor.execute("""
+        SELECT * FROM notifications 
+        WHERE user_id = ? 
+        ORDER BY created_at DESC 
+        LIMIT 50
+    """, (g.user['id'],))
+    
+    notifications = [dict(row) for row in cursor.fetchall()]
+    
+    # Count unread
+    cursor.execute("""
+        SELECT COUNT(*) as count FROM notifications 
+        WHERE user_id = ? AND read = 0
+    """, (g.user['id'],))
+    unread = cursor.fetchone()['count']
+    
+    conn.close()
+    
+    return jsonify({"notifications": notifications, "unread_count": unread})
+
+
+@dashboard_api.route('/user/notifications/read', methods=['POST'])
+@auth_required
+def mark_notifications_read():
+    """Mark notifications as read"""
+    data = request.json
+    notification_ids = data.get('ids', [])
+    
+    conn = get_db()
+    cursor = conn.cursor()
+    
+    if notification_ids:
+        placeholders = ','.join(['?' for _ in notification_ids])
+        cursor.execute(f"""
+            UPDATE notifications SET read = 1 
+            WHERE user_id = ? AND id IN ({placeholders})
+        """, [g.user['id']] + notification_ids)
+    else:
+        cursor.execute("UPDATE notifications SET read = 1 WHERE user_id = ?", (g.user['id'],))
+    
+    conn.commit()
+    conn.close()
+    
+    return jsonify({"status": "marked_read"})
+
+
+# ═══════════════════════════════════════════════════════════════
+# SELLER ENDPOINTS - SERVICE MANAGEMENT
+# ═══════════════════════════════════════════════════════════════
+
+@dashboard_api.route('/seller/services')
+@auth_required
+def list_my_services():
+    """List seller's services"""
+    conn = get_db()
+    cursor = conn.cursor()
+    
+    cursor.execute("""
+        SELECT s.*, 
+               (SELECT COUNT(*) FROM service_endpoints WHERE service_id = s.id) as endpoint_count
+        FROM services s
+        WHERE s.owner_id = ?
+        ORDER BY s.created_at DESC
+    """, (g.user['id'],))
+    
+    services = [dict(row) for row in cursor.fetchall()]
+    conn.close()
+    
+    return jsonify({"services": services})
+
+
+@dashboard_api.route('/seller/services', methods=['POST'])
+@auth_required
+def create_service():
+    """Register a new service"""
+    data = request.json
+    
+    required = ['name', 'base_url', 'treasury_wallet']
+    for field in required:
+        if not data.get(field):
+            return jsonify({"error": f"Missing required field: {field}"}), 400
+    
+    service_id = f"svc_{secrets.token_hex(8)}"
+    slug = data.get('slug') or data['name'].lower().replace(' ', '-')[:50]
+    now = datetime.now(UTC).isoformat()
+    
+    conn = get_db()
+    cursor = conn.cursor()
+    
+    try:
+        cursor.execute("""
+            INSERT INTO services 
+            (id, owner_id, name, slug, description, base_url, docs_url, treasury_wallet,
+             negotiation_mode, min_acceptable_ratio, token_gating_enabled, token_mint,
+             token_min_balance, tags, category, status, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            service_id,
+            g.user['id'],
+            data['name'],
+            slug,
+            data.get('description', ''),
+            data['base_url'],
+            data.get('docs_url'),
+            data['treasury_wallet'],
+            data.get('negotiation_mode', 'auto'),
+            data.get('min_acceptable_ratio', 0.6),
+            1 if data.get('token_gating_enabled') else 0,
+            data.get('token_mint'),
+            data.get('token_min_balance', 0),
+            data.get('tags', ''),
+            data.get('category', 'api'),
+            'pending',  # Requires approval
+            now, now
+        ))
+        
+        conn.commit()
+        
+        # Create notification for admin
+        cursor.execute("""
+            INSERT INTO notifications (user_id, type, title, message, created_at)
+            VALUES (?, ?, ?, ?, ?)
+        """, (g.user['id'], 'service_created', 'Service Submitted',
+              f"Your service '{data['name']}' has been submitted for review.", now))
+        conn.commit()
+        
+    except sqlite3.IntegrityError as e:
+        conn.close()
+        return jsonify({"error": "Service slug already exists"}), 400
+    
+    conn.close()
+    
+    return jsonify({
+        "service_id": service_id,
+        "slug": slug,
+        "status": "pending",
+        "message": "Service submitted for review"
+    })
+
+
+@dashboard_api.route('/seller/services/<service_id>', methods=['PUT'])
+@auth_required
+def update_service(service_id):
+    """Update service details"""
+    conn = get_db()
+    cursor = conn.cursor()
+    
+    # Verify ownership
+    cursor.execute("SELECT * FROM services WHERE id = ? AND owner_id = ?", 
+                   (service_id, g.user['id']))
+    if not cursor.fetchone():
+        conn.close()
+        return jsonify({"error": "Service not found or not owned by you"}), 404
+    
+    data = request.json
+    allowed = ['name', 'description', 'base_url', 'docs_url', 'treasury_wallet',
+               'negotiation_mode', 'min_acceptable_ratio', 'token_gating_enabled',
+               'token_mint', 'token_min_balance', 'tags', 'category']
+    
+    updates = {k: v for k, v in data.items() if k in allowed}
+    if not updates:
+        conn.close()
+        return jsonify({"error": "No valid fields to update"}), 400
+    
+    updates['updated_at'] = datetime.now(UTC).isoformat()
+    
+    set_clause = ", ".join([f"{k} = ?" for k in updates.keys()])
+    values = list(updates.values()) + [service_id]
+    
+    cursor.execute(f"UPDATE services SET {set_clause} WHERE id = ?", values)
+    conn.commit()
+    conn.close()
+    
+    return jsonify({"status": "updated"})
+
+
+@dashboard_api.route('/seller/services/<service_id>/endpoints')
+@auth_required
+def list_service_endpoints(service_id):
+    """List endpoints for a service"""
+    conn = get_db()
+    cursor = conn.cursor()
+    
+    cursor.execute("""
+        SELECT e.* FROM service_endpoints e
+        JOIN services s ON e.service_id = s.id
+        WHERE e.service_id = ? AND s.owner_id = ?
+    """, (service_id, g.user['id']))
+    
+    endpoints = [dict(row) for row in cursor.fetchall()]
+    conn.close()
+    
+    return jsonify({"endpoints": endpoints})
+
+
+@dashboard_api.route('/seller/services/<service_id>/endpoints', methods=['POST'])
+@auth_required
+def add_service_endpoint(service_id):
+    """Add endpoint to service"""
+    conn = get_db()
+    cursor = conn.cursor()
+    
+    # Verify ownership
+    cursor.execute("SELECT * FROM services WHERE id = ? AND owner_id = ?",
+                   (service_id, g.user['id']))
+    if not cursor.fetchone():
+        conn.close()
+        return jsonify({"error": "Service not found"}), 404
+    
+    data = request.json
+    
+    cursor.execute("""
+        INSERT INTO service_endpoints 
+        (service_id, method, endpoint, description, base_price, dynamic_pricing_enabled, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+    """, (
+        service_id,
+        data.get('method', 'GET'),
+        data['endpoint'],
+        data.get('description', ''),
+        float(data['base_price']),
+        1 if data.get('dynamic_pricing_enabled', True) else 0,
+        datetime.now(UTC).isoformat()
+    ))
+    
+    conn.commit()
+    endpoint_id = cursor.lastrowid
+    conn.close()
+    
+    return jsonify({"endpoint_id": endpoint_id, "status": "created"})
+
+
+@dashboard_api.route('/seller/analytics')
+@auth_required
+def seller_analytics():
+    """Get seller analytics"""
+    conn = get_db()
+    cursor = conn.cursor()
+    
+    # Get all services owned by user
+    cursor.execute("SELECT id FROM services WHERE owner_id = ?", (g.user['id'],))
+    service_ids = [row['id'] for row in cursor.fetchall()]
+    
+    if not service_ids:
+        conn.close()
+        return jsonify({"message": "No services found", "analytics": {}})
+    
+    placeholders = ','.join(['?' for _ in service_ids])
+    
+    # Total stats
+    cursor.execute(f"""
+        SELECT COUNT(*) as total_txns, 
+               COALESCE(SUM(price), 0) as total_revenue,
+               COALESCE(AVG(price), 0) as avg_price
+        FROM transactions WHERE seller_id IN ({placeholders})
+    """, service_ids)
+    totals = dict(cursor.fetchone())
+    
+    # Last 30 days daily
+    cursor.execute(f"""
+        SELECT DATE(timestamp) as date, 
+               COUNT(*) as transactions,
+               SUM(price) as revenue
+        FROM transactions 
+        WHERE seller_id IN ({placeholders})
+        AND timestamp > datetime('now', '-30 days')
+        GROUP BY DATE(timestamp)
+        ORDER BY date DESC
+    """, service_ids)
+    daily = [dict(row) for row in cursor.fetchall()]
+    
+    # Top endpoints
+    cursor.execute(f"""
+        SELECT service_type, COUNT(*) as count, SUM(price) as revenue
+        FROM transactions 
+        WHERE seller_id IN ({placeholders})
+        GROUP BY service_type
+        ORDER BY revenue DESC
+        LIMIT 10
+    """, service_ids)
+    top_endpoints = [dict(row) for row in cursor.fetchall()]
+    
+    # Active negotiations
+    cursor.execute(f"""
+        SELECT COUNT(*) as count FROM negotiations 
+        WHERE service_id IN ({placeholders}) AND status IN ('pending', 'countered')
+    """, service_ids)
+    active_negotiations = cursor.fetchone()['count']
+    
+    conn.close()
+    
+    return jsonify({
+        "totals": totals,
+        "daily": daily,
+        "top_endpoints": top_endpoints,
+        "active_negotiations": active_negotiations
+    })
+
+
+@dashboard_api.route('/seller/negotiations')
+@auth_required
+def seller_negotiations():
+    """Get seller's negotiations"""
+    conn = get_db()
+    cursor = conn.cursor()
+    
+    status_filter = request.args.get('status', 'all')
+    
+    # Get service IDs owned by user
+    cursor.execute("SELECT id FROM services WHERE owner_id = ?", (g.user['id'],))
+    service_ids = [row['id'] for row in cursor.fetchall()]
+    
+    if not service_ids:
+        conn.close()
+        return jsonify({"negotiations": []})
+    
+    placeholders = ','.join(['?' for _ in service_ids])
+    
+    query = f"""
+        SELECT n.*, s.name as service_name,
+               bp.display_name as buyer_name
+        FROM negotiations n
+        JOIN services s ON n.service_id = s.id
+        LEFT JOIN buyer_profiles bp ON n.buyer_id = bp.buyer_id
+        WHERE n.service_id IN ({placeholders})
+    """
+    
+    params = list(service_ids)
+    
+    if status_filter != 'all':
+        query += " AND n.status = ?"
+        params.append(status_filter)
+    
+    query += " ORDER BY n.updated_at DESC LIMIT 50"
+    
+    cursor.execute(query, params)
+    negotiations = [dict(row) for row in cursor.fetchall()]
+    conn.close()
+    
+    return jsonify({"negotiations": negotiations})
+
+
+@dashboard_api.route('/seller/negotiations/<neg_id>/override', methods=['POST'])
+@auth_required
+def override_negotiation(neg_id):
+    """Seller overrides AI decision"""
+    conn = get_db()
+    cursor = conn.cursor()
+    
+    # Verify ownership via service
+    cursor.execute("""
+        SELECT n.*, s.owner_id FROM negotiations n
+        JOIN services s ON n.service_id = s.id
+        WHERE n.id = ?
+    """, (neg_id,))
+    neg = cursor.fetchone()
+    
+    if not neg:
+        conn.close()
+        return jsonify({"error": "Negotiation not found"}), 404
+    
+    if neg['owner_id'] != g.user['id']:
+        conn.close()
+        return jsonify({"error": "Not authorized"}), 403
+    
+    if neg['status'] not in ['pending', 'countered']:
+        conn.close()
+        return jsonify({"error": "Cannot override completed negotiation"}), 400
+    
+    data = request.json
+    action = data.get('action')  # 'accept', 'counter', 'reject'
+    override_price = data.get('price')
+    reason = data.get('reason', '')
+    
+    now = datetime.now(UTC).isoformat()
+    
+    # Log override
+    cursor.execute("""
+        INSERT INTO negotiation_overrides 
+        (negotiation_id, seller_id, original_action, override_action, override_price, reason, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+    """, (neg_id, g.user['id'], neg['status'], action, override_price, reason, now))
+    
+    # Update negotiation
+    if action == 'accept':
+        final_price = override_price or neg['current_offer']
+        cursor.execute("""
+            UPDATE negotiations SET status = 'accepted', final_price = ?, updated_at = ?
+            WHERE id = ?
+        """, (final_price, now, neg_id))
+    elif action == 'counter':
+        cursor.execute("""
+            UPDATE negotiations SET status = 'countered', counter_price = ?, updated_at = ?
+            WHERE id = ?
+        """, (override_price, now, neg_id))
+    elif action == 'reject':
+        cursor.execute("""
+            UPDATE negotiations SET status = 'rejected', updated_at = ?
+            WHERE id = ?
+        """, (now, neg_id))
+    
+    # Notify buyer (create notification)
+    cursor.execute("""
+        INSERT INTO notifications (user_id, type, title, message, data, created_at)
+        VALUES (?, ?, ?, ?, ?, ?)
+    """, (
+        neg['buyer_id'],
+        'negotiation_update',
+        'Negotiation Updated',
+        f"The seller has responded to your negotiation",
+        json.dumps({"negotiation_id": neg_id, "action": action}),
+        now
+    ))
+    
+    conn.commit()
+    conn.close()
+    
+    return jsonify({"status": "overridden", "action": action})
+
+
+# ═══════════════════════════════════════════════════════════════
+# BUYER ENDPOINTS - MARKETPLACE
+# ═══════════════════════════════════════════════════════════════
+
+@dashboard_api.route('/marketplace/services')
+def list_marketplace_services():
+    """List all active services in marketplace"""
+    conn = get_db()
+    cursor = conn.cursor()
+    
+    category = request.args.get('category')
+    search = request.args.get('search')
+    
+    query = """
+        SELECT s.*, u.display_name as owner_name,
+               (SELECT COUNT(*) FROM service_endpoints WHERE service_id = s.id) as endpoint_count,
+               (SELECT MIN(base_price) FROM service_endpoints WHERE service_id = s.id) as min_price,
+               (SELECT MAX(base_price) FROM service_endpoints WHERE service_id = s.id) as max_price
+        FROM services s
+        LEFT JOIN users u ON s.owner_id = u.id
+        WHERE s.status = 'active'
+    """
+    params = []
+    
+    if category:
+        query += " AND s.category = ?"
+        params.append(category)
+    
+    if search:
+        query += " AND (s.name LIKE ? OR s.description LIKE ? OR s.tags LIKE ?)"
+        search_term = f"%{search}%"
+        params.extend([search_term, search_term, search_term])
+    
+    query += " ORDER BY s.featured DESC, s.total_revenue DESC"
+    
+    cursor.execute(query, params)
+    services = [dict(row) for row in cursor.fetchall()]
+    conn.close()
+    
+    return jsonify({"services": services})
+
+
+@dashboard_api.route('/marketplace/services/<slug>')
+def get_service_details(slug):
+    """Get service details by slug"""
+    conn = get_db()
+    cursor = conn.cursor()
+    
+    cursor.execute("""
+        SELECT s.*, u.display_name as owner_name
+        FROM services s
+        LEFT JOIN users u ON s.owner_id = u.id
+        WHERE s.slug = ? AND s.status = 'active'
+    """, (slug,))
+    service = cursor.fetchone()
+    
+    if not service:
+        conn.close()
+        return jsonify({"error": "Service not found"}), 404
+    
+    service = dict(service)
+    
+    # Get endpoints
+    cursor.execute("""
+        SELECT * FROM service_endpoints WHERE service_id = ?
+    """, (service['id'],))
+    service['endpoints'] = [dict(row) for row in cursor.fetchall()]
+    
+    # Get reviews
+    cursor.execute("""
+        SELECT r.*, u.display_name as reviewer_name
+        FROM service_reviews r
+        LEFT JOIN users u ON r.user_id = u.id
+        WHERE r.service_id = ?
+        ORDER BY r.created_at DESC
+        LIMIT 10
+    """, (service['id'],))
+    service['reviews'] = [dict(row) for row in cursor.fetchall()]
+    
+    conn.close()
+    
+    return jsonify({"service": service})
+
+
+@dashboard_api.route('/buyer/purchases')
+@auth_required
+def buyer_purchases():
+    """Get buyer's purchase history"""
+    conn = get_db()
+    cursor = conn.cursor()
+    
+    cursor.execute("""
+        SELECT t.*, s.name as service_name
+        FROM transactions t
+        LEFT JOIN services s ON t.seller_id = s.id
+        WHERE t.buyer_id = ?
+        ORDER BY t.timestamp DESC
+        LIMIT 100
+    """, (g.user['id'],))
+    
+    purchases = [dict(row) for row in cursor.fetchall()]
+    conn.close()
+    
+    return jsonify({"purchases": purchases})
+
+
+@dashboard_api.route('/buyer/negotiations')
+@auth_required
+def buyer_negotiations():
+    """Get buyer's negotiations"""
+    conn = get_db()
+    cursor = conn.cursor()
+    
+    cursor.execute("""
+        SELECT n.*, s.name as service_name
+        FROM negotiations n
+        LEFT JOIN services s ON n.service_id = s.id
+        WHERE n.buyer_id = ?
+        ORDER BY n.updated_at DESC
+        LIMIT 50
+    """, (g.user['id'],))
+    
+    negotiations = [dict(row) for row in cursor.fetchall()]
+    conn.close()
+    
+    return jsonify({"negotiations": negotiations})
+
+
+@dashboard_api.route('/buyer/stats')
+@auth_required
+def buyer_stats():
+    """Get buyer statistics"""
+    conn = get_db()
+    cursor = conn.cursor()
+    
+    cursor.execute("""
+        SELECT COUNT(*) as total_purchases,
+               COALESCE(SUM(price), 0) as total_spent,
+               COALESCE(AVG(price), 0) as avg_purchase
+        FROM transactions WHERE buyer_id = ?
+    """, (g.user['id'],))
+    
+    stats = dict(cursor.fetchone())
+    
+    # Favorite services
+    cursor.execute("""
+        SELECT seller_id, COUNT(*) as count, SUM(price) as spent
+        FROM transactions WHERE buyer_id = ?
+        GROUP BY seller_id
+        ORDER BY count DESC
+        LIMIT 5
+    """, (g.user['id'],))
+    stats['favorite_services'] = [dict(row) for row in cursor.fetchall()]
+    
+    conn.close()
+    
+    return jsonify({"stats": stats})
+
+
+# ═══════════════════════════════════════════════════════════════
+# ADMIN ENDPOINTS (for service approval)
+# ═══════════════════════════════════════════════════════════════
+
+@dashboard_api.route('/admin/pending-services')
+@auth_required
+def admin_pending_services():
+    """List pending services (admin only)"""
+    # TODO: Add proper admin check
+    if g.user['role'] != 'admin' and g.user['id'] != 'user_edu':
+        return jsonify({"error": "Admin only"}), 403
+    
+    conn = get_db()
+    cursor = conn.cursor()
+    
+    cursor.execute("""
+        SELECT s.*, u.display_name as owner_name
+        FROM services s
+        LEFT JOIN users u ON s.owner_id = u.id
+        WHERE s.status = 'pending'
+        ORDER BY s.created_at ASC
+    """)
+    
+    services = [dict(row) for row in cursor.fetchall()]
+    conn.close()
+    
+    return jsonify({"services": services})
+
+
+@dashboard_api.route('/admin/services/<service_id>/approve', methods=['POST'])
+@auth_required
+def admin_approve_service(service_id):
+    """Approve a pending service"""
+    if g.user['role'] != 'admin' and g.user['id'] != 'user_edu':
+        return jsonify({"error": "Admin only"}), 403
+    
+    conn = get_db()
+    cursor = conn.cursor()
+    
+    now = datetime.now(UTC).isoformat()
+    
+    cursor.execute("""
+        UPDATE services SET status = 'active', updated_at = ? WHERE id = ?
+    """, (now, service_id))
+    
+    # Notify owner
+    cursor.execute("SELECT owner_id, name FROM services WHERE id = ?", (service_id,))
+    service = cursor.fetchone()
+    
+    if service:
+        cursor.execute("""
+            INSERT INTO notifications (user_id, type, title, message, created_at)
+            VALUES (?, ?, ?, ?, ?)
+        """, (service['owner_id'], 'service_approved', 'Service Approved',
+              f"Your service '{service['name']}' has been approved and is now live!", now))
+    
+    conn.commit()
+    conn.close()
+    
+    return jsonify({"status": "approved"})
+
+
+if __name__ == "__main__":
+    print("Dashboard API Blueprint - import into main app")
