@@ -250,7 +250,22 @@ def create_service():
     service_id = f"svc_{secrets.token_hex(8)}"
     slug = data.get('slug') or data['name'].lower().replace(' ', '-')[:50]
     now = datetime.now(UTC).isoformat()
-    
+
+    # Calculate min_price and max_price from pricing_unlimited and min_acceptable_ratio
+    pricing_unlimited_val = data.get('pricing_unlimited')
+    min_acceptable_ratio_val = data.get('min_acceptable_ratio', 0.6)
+    negotiation_mode_val = data.get('negotiation_mode', 'auto')
+
+    if pricing_unlimited_val and negotiation_mode_val == 'auto':
+        max_price_calc = float(pricing_unlimited_val)
+        min_price_calc = max_price_calc * float(min_acceptable_ratio_val)
+    elif pricing_unlimited_val and negotiation_mode_val == 'fixed':
+        max_price_calc = float(pricing_unlimited_val)
+        min_price_calc = float(pricing_unlimited_val)
+    else:
+        max_price_calc = None
+        min_price_calc = None
+
     conn = get_db()
     cursor = conn.cursor()
     
@@ -261,8 +276,9 @@ def create_service():
              negotiation_mode, min_acceptable_ratio, token_gating_enabled, token_mint,
              token_min_balance, tags, category, status, created_at, updated_at,
              auth_type, auth_instructions, access_types, 
-             pricing_per_day, pricing_per_week, pricing_per_month, pricing_unlimited)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             pricing_per_day, pricing_per_week, pricing_per_month, pricing_unlimited,
+             min_price, max_price)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             service_id,
             g.user['id'],
@@ -283,11 +299,13 @@ def create_service():
             now, now,
             data.get('auth_type', 'api_key'),
             data.get('auth_instructions', ''),
-            data.get('access_types', 'per_request'),
+            data.get('access_types', 'unlimited'),
             data.get('pricing_per_day'),
             data.get('pricing_per_week'),
             data.get('pricing_per_month'),
-            data.get('pricing_unlimited')
+            data.get('pricing_unlimited'),
+            min_price_calc,
+            max_price_calc
         ))
         conn.commit()
         
@@ -665,6 +683,7 @@ def get_service_details(slug):
         SELECT * FROM service_endpoints WHERE service_id = ?
     """, (service['id'],))
     service['endpoints'] = [dict(row) for row in cursor.fetchall()]
+    service['endpoint_count'] = len(service['endpoints'])
     
     # Get reviews
     cursor.execute("""
@@ -1442,3 +1461,161 @@ def claim_holder_access():
         "message": f"Free unlimited access granted! Tier: {holder_status.get('tier', 'holder').upper()}"
     })
 
+
+
+# ═══════════════════════════════════════════════════════════════
+# PUBLIC API KEY VALIDATION (For Sellers to validate buyer API keys)
+# ═══════════════════════════════════════════════════════════════
+
+@dashboard_api.route('/validate-key', methods=['POST'])
+def validate_api_key():
+    """
+    Public endpoint for sellers to validate buyer API keys.
+    
+    Sellers call this endpoint from their service to verify if an API key is valid.
+    
+    Request body:
+    {
+        "api_key": "se_xxxxx...",
+        "service_id": "svc_xxxxx..." (optional - if provided, validates key is for this service)
+    }
+    
+    Response (valid):
+    {
+        "valid": true,
+        "service_id": "svc_xxxxx",
+        "buyer_id": "user_xxxxx",
+        "access_type": "unlimited",
+        "status": "active",
+        "expires_at": null
+    }
+    
+    Response (invalid):
+    {
+        "valid": false,
+        "error": "Invalid or expired API key"
+    }
+    """
+    data = request.json
+    
+    if not data or not data.get('api_key'):
+        return jsonify({"valid": False, "error": "Missing api_key"}), 400
+    
+    api_key = data['api_key']
+    service_id_filter = data.get('service_id')
+    
+    # Hash the API key to compare with stored hash
+    api_key_hash = hashlib.sha256(api_key.encode()).hexdigest()
+    
+    conn = get_db()
+    cursor = conn.cursor()
+    
+    # Build query
+    query = """
+        SELECT ba.*, s.name as service_name, s.base_url as service_base_url
+        FROM buyer_access ba
+        LEFT JOIN services s ON ba.service_id = s.id
+        WHERE ba.api_key_hash = ?
+    """
+    params = [api_key_hash]
+    
+    if service_id_filter:
+        query += " AND ba.service_id = ?"
+        params.append(service_id_filter)
+    
+    cursor.execute(query, params)
+    access = cursor.fetchone()
+    conn.close()
+    
+    if not access:
+        return jsonify({"valid": False, "error": "Invalid API key"}), 401
+    
+    access = dict(access)
+    
+    # Check if access is active
+    if access['status'] != 'active':
+        return jsonify({"valid": False, "error": f"API key is {access['status']}"}), 401
+    
+    # Check expiration
+    if access['expires_at']:
+        expires = datetime.fromisoformat(access['expires_at'].replace('Z', '+00:00'))
+        if datetime.now(UTC) > expires:
+            return jsonify({"valid": False, "error": "API key has expired"}), 401
+    
+    # Valid key - return access info
+    return jsonify({
+        "valid": True,
+        "service_id": access['service_id'],
+        "service_name": access.get('service_name'),
+        "buyer_id": access['buyer_id'],
+        "access_type": access['access_type'],
+        "status": access['status'],
+        "expires_at": access['expires_at'],
+        "requests_used": access.get('requests_used', 0),
+        "requests_limit": access.get('requests_limit')
+    })
+
+
+@dashboard_api.route('/validate-key/simple', methods=['GET'])
+def validate_api_key_simple():
+    """
+    Simple GET endpoint for quick validation via Authorization header.
+    
+    Sellers can call: GET /api/dashboard/validate-key/simple
+    With header: Authorization: Bearer se_xxxxx...
+    And optional query param: ?service_id=svc_xxxxx
+    
+    Returns same response as POST /validate-key
+    """
+    auth_header = request.headers.get('Authorization')
+    
+    if not auth_header or not auth_header.startswith('Bearer '):
+        return jsonify({"valid": False, "error": "Missing or invalid Authorization header"}), 400
+    
+    api_key = auth_header.replace('Bearer ', '').strip()
+    service_id_filter = request.args.get('service_id')
+    
+    # Hash the API key
+    api_key_hash = hashlib.sha256(api_key.encode()).hexdigest()
+    
+    conn = get_db()
+    cursor = conn.cursor()
+    
+    query = """
+        SELECT ba.*, s.name as service_name, s.base_url as service_base_url
+        FROM buyer_access ba
+        LEFT JOIN services s ON ba.service_id = s.id
+        WHERE ba.api_key_hash = ?
+    """
+    params = [api_key_hash]
+    
+    if service_id_filter:
+        query += " AND ba.service_id = ?"
+        params.append(service_id_filter)
+    
+    cursor.execute(query, params)
+    access = cursor.fetchone()
+    conn.close()
+    
+    if not access:
+        return jsonify({"valid": False, "error": "Invalid API key"}), 401
+    
+    access = dict(access)
+    
+    if access['status'] != 'active':
+        return jsonify({"valid": False, "error": f"API key is {access['status']}"}), 401
+    
+    if access['expires_at']:
+        expires = datetime.fromisoformat(access['expires_at'].replace('Z', '+00:00'))
+        if datetime.now(UTC) > expires:
+            return jsonify({"valid": False, "error": "API key has expired"}), 401
+    
+    return jsonify({
+        "valid": True,
+        "service_id": access['service_id'],
+        "service_name": access.get('service_name'),
+        "buyer_id": access['buyer_id'],
+        "access_type": access['access_type'],
+        "status": access['status'],
+        "expires_at": access['expires_at']
+    })
