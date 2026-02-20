@@ -22,8 +22,9 @@ Sentinel Economic is a decentralized marketplace that enables AI agents and huma
 - Counter-offer generation with personalized messaging
 
 ### Dashboard Features
-- **Buyer Mode**: Browse services, negotiate prices, manage API keys
-- **Seller Mode**: List services, set pricing, monitor analytics
+- **Buyer Mode**: Browse services, negotiate prices, manage API keys with documentation
+- **Seller Mode**: List services, set pricing, monitor analytics, validate buyer API keys
+- **My Access Panel**: Quick Start guide, endpoint documentation, and code examples for purchased services
 - **Analytics**: Track spending, purchases, and usage patterns
 
 ### Security
@@ -64,43 +65,6 @@ Sentinel Economic is a decentralized marketplace that enables AI agents and huma
 └─────────────────────────────────────────────────────────────┘
 ```
 
-## Quick Start
-
-### Prerequisites
-- Python 3.10+
-- Node.js 18+ (for frontend)
-- SQLite3
-- Solana wallet (Phantom recommended)
-
-### Installation
-
-1. **Clone the repository**
-```bash
-git clone https://github.com/yourusername/sentinel-economic.git
-cd sentinel-economic
-```
-
-2. **Install Python dependencies**
-```bash
-pip install -r requirements.txt
-```
-
-3. **Initialize the database**
-```bash
-python scripts/setup_database.py
-```
-
-4. **Start the API server**
-```bash
-python scripts/dashboard_api.py
-```
-
-The API will be available at `http://localhost:8101`
-
-### Frontend Setup
-
-The frontend is located in the main Oracle Sentinel dashboard. See [oracle-sentinel](https://github.com/anthropics/oracle-sentinel) for frontend setup.
-
 ## Payment Flow
 
 ### Direct USDC Payment
@@ -122,43 +86,44 @@ The frontend is located in the main Oracle Sentinel dashboard. See [oracle-senti
 6. User claims free API key
 ```
 
-## Using Your API Key
+## For Buyers: Using Your API Key
 
-After purchasing access from Sentinel Economic, you'll receive an API key. Here's how to use it:
+After purchasing access from any service on Sentinel Economic, you'll receive an API key starting with `se_`.
 
 ### Authentication
 
-Include your API key in the request header:
+Most services use Bearer token authentication:
 ```bash
-curl -X GET "https://api.oraclesentinel.xyz/api/v1/signal" \
-  -H "X-API-Key: your_api_key_here"
+curl -X POST "https://service-url.com/endpoint" \
+  -H "Authorization: Bearer se_your_api_key_here" \
+  -H "Content-Type: application/json"
 ```
 
 ### Example: Python
 ```python
 import requests
 
-API_KEY = "your_api_key_here"
-BASE_URL = "https://api.oraclesentinel.xyz"
+API_KEY = "se_your_api_key_here"
+BASE_URL = "https://service-url.com"  # Check service documentation
 
 headers = {
-    "X-API-Key": API_KEY
+    "Authorization": f"Bearer {API_KEY}",
+    "Content-Type": "application/json"
 }
 
-# Get prediction signal
-response = requests.get(f"{BASE_URL}/api/v1/signal", headers=headers)
-data = response.json()
-print(data)
+response = requests.get(f"{BASE_URL}/endpoint", headers=headers)
+print(response.json())
 ```
 
 ### Example: JavaScript
 ```javascript
-const API_KEY = "your_api_key_here";
-const BASE_URL = "https://api.oraclesentinel.xyz";
+const API_KEY = "se_your_api_key_here";
+const BASE_URL = "https://service-url.com";
 
-const response = await fetch(`${BASE_URL}/api/v1/signal`, {
+const response = await fetch(`${BASE_URL}/endpoint`, {
   headers: {
-    "X-API-Key": API_KEY
+    "Authorization": `Bearer ${API_KEY}`,
+    "Content-Type": "application/json"
   }
 });
 
@@ -166,14 +131,112 @@ const data = await response.json();
 console.log(data);
 ```
 
-### Error Handling
+> **Note**: Each service has its own endpoints and documentation. Check the "My Access" panel for service-specific Quick Start guides and code examples.
 
-| Status Code | Description |
-|-------------|-------------|
-| 200 | Success |
-| 401 | Invalid or missing API key |
-| 402 | Insufficient balance (for per-request) |
-| 500 | Server error |
+## For Sellers: Integration Guide
+
+Sellers can list their APIs on Sentinel Economic and validate buyer API keys.
+
+### API Key Validation
+
+Validate buyer API keys from your backend:
+```bash
+curl -X POST "https://economic.oraclesentinel.xyz/api/dashboard/validate-key" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "api_key": "se_xxxxx...",
+    "service_id": "svc_your_service_id"
+  }'
+```
+
+**Response (valid):**
+```json
+{
+  "valid": true,
+  "service_id": "svc_xxxxx",
+  "service_name": "Your Service",
+  "buyer_id": "user_xxxxx",
+  "access_type": "unlimited",
+  "status": "active"
+}
+```
+
+**Response (invalid):**
+```json
+{
+  "valid": false,
+  "error": "Invalid API key"
+}
+```
+
+### Integration Example (Node.js)
+```javascript
+const SENTINEL_ECONOMIC_URL = "https://economic.oraclesentinel.xyz";
+const SERVICE_ID = "svc_your_service_id";
+
+async function validateApiKey(apiKey) {
+  const response = await fetch(`${SENTINEL_ECONOMIC_URL}/api/dashboard/validate-key`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ api_key: apiKey, service_id: SERVICE_ID })
+  });
+  return response.json();
+}
+
+// Express middleware
+async function authMiddleware(req, res, next) {
+  const authHeader = req.headers.authorization;
+  
+  if (!authHeader?.startsWith('Bearer ')) {
+    return res.status(401).json({ error: 'Missing Authorization header' });
+  }
+  
+  const apiKey = authHeader.replace('Bearer ', '').trim();
+  const validation = await validateApiKey(apiKey);
+  
+  if (!validation.valid) {
+    return res.status(401).json({ error: validation.error });
+  }
+  
+  req.buyer = validation;
+  next();
+}
+```
+
+### Integration Example (Python)
+```python
+import requests
+from functools import wraps
+from flask import request, jsonify
+
+SENTINEL_ECONOMIC_URL = "https://economic.oraclesentinel.xyz"
+SERVICE_ID = "svc_your_service_id"
+
+def validate_api_key(api_key: str) -> dict:
+    response = requests.post(
+        f"{SENTINEL_ECONOMIC_URL}/api/dashboard/validate-key",
+        json={"api_key": api_key, "service_id": SERVICE_ID}
+    )
+    return response.json()
+
+def require_api_key(f):
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        auth_header = request.headers.get('Authorization', '')
+        
+        if not auth_header.startswith('Bearer '):
+            return jsonify({"error": "Missing Authorization header"}), 401
+        
+        api_key = auth_header.replace('Bearer ', '').strip()
+        validation = validate_api_key(api_key)
+        
+        if not validation.get('valid'):
+            return jsonify({"error": validation.get('error')}), 401
+        
+        request.buyer = validation
+        return f(*args, **kwargs)
+    return decorated
+```
 
 ## AI Negotiation System
 
@@ -191,26 +254,6 @@ The AI negotiation engine uses multiple strategies based on buyer behavior:
 - Acceptance rate monitoring
 - Behavior tagging
 
-## Security Considerations
-
-1. **Never commit sensitive data**: API keys, private keys, database files
-2. **Use environment variables** for production secrets
-3. **Validate all wallet addresses** before processing
-
-## Contributing
-
-Contributions are welcome! Please read our contributing guidelines before submitting PRs.
-
-1. Fork the repository
-2. Create your feature branch (`git checkout -b feature/amazing-feature`)
-3. Commit your changes (`git commit -m 'Add amazing feature'`)
-4. Push to the branch (`git push origin feature/amazing-feature`)
-5. Open a Pull Request
-
-## License
-
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
-
 ## Links
 
 - **Sentinel Economic**: [economic.oraclesentinel.xyz](https://economic.oraclesentinel.xyz)
@@ -219,6 +262,6 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 - **Website**: [oraclesentinel.xyz](https://oraclesentinel.xyz)
 - **X**: [@oracle_sentinel](https://x.com/oracle_sentinel)
 
-## Support
+## License
 
-For support, please open an issue on GitHub or reach out on X.
+This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
